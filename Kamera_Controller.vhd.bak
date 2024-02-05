@@ -1,0 +1,313 @@
+library ieee;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
+
+entity kamera_controller is
+  port (
+    clock_50 : in    std_logic;
+    reset_n  : in    std_logic;
+
+    ------------------SDRAM---------------------------
+    dram_addr  : out   std_logic_vector(12 downto 0);
+    dram_ba    : out   std_logic_vector(1 downto 0);
+    dram_cas_n : out   std_logic;
+    dram_cke   : out   std_logic;
+    dram_clk   : out   std_logic;
+    dram_cs_n  : out   std_logic;
+    dram_dq    : inout std_logic_vector(15 downto 0);
+    dram_ras_n : out   std_logic;
+    dram_we_n  : out   std_logic;
+    dram_ldqm  : out   std_logic;
+    dram_udqm  : out   std_logic;
+
+    -------------------VGA----------------------------
+    h_sync      : out   std_logic;
+    v_sync      : out   std_logic;
+    valid_pixel : out   std_logic;
+    vga_out     : out   std_logic_vector(11 downto 0);
+
+    ---------------- Kamera -----------------------------
+    camera_pixclk    : in    std_logic;
+    camera_pixel_out : in    std_logic_vector(11 downto 0);
+    camera_strobe    : in    std_logic;
+    camera_lval      : in    std_logic;
+    camera_fval      : in    std_logic;
+
+    camera_sdata : inout std_logic;
+    camera_sclk  : out   std_logic;
+
+    camera_xclk    : out   std_logic;
+    camera_reset_n : out   std_logic;
+    camera_trigger : out   std_logic;
+
+    ----------------- flags -----------------------------
+    wr_full   : out   std_logic;
+    rd_empty  : out   std_logic;
+    ram_rdval : out   std_logic;
+
+    ----------------------------------------------------
+    data_out : out   std_logic_vector(15 downto 0);
+    data_in  : in    std_logic_vector(9 downto 0)
+  );
+end entity kamera_controller;
+
+architecture rtl of kamera_controller is
+
+  type modes is (read_t, write_t);
+
+  ----------------- clocks ------------------------------
+  signal clk143_s    : std_logic;
+  signal clk25_175_s : std_logic;
+  signal clk_96_s    : std_logic;
+
+  ------------------sdram--------------------------------
+  signal mode_s                              : modes := write_t;
+  signal sdram_addr_s                        : std_logic_vector(24 downto 0);
+  signal sdram_be_n_s                        : std_logic_vector(1 downto 0);
+  signal sdram_cs_s                          : std_logic;
+  signal sdram_rdval_s,    sdram_wait_s      : std_logic;
+  signal sdram_re_n_s,     sdram_we_n_s      : std_logic;
+  signal sdram_readdata_s, sdram_writedata_s : std_logic_vector(15 downto 0);
+  signal dram_dqm_s                          : std_logic_vector(1 downto 0);
+  signal sdram_out_data_s                    : std_logic_vector(15 downto 0);
+
+  -----------------vga puffer-------------------------------------
+
+  signal puffer_data_s : std_logic_vector(15 downto 0);
+  -- signal fifo_rdclk_s   : std_logic;
+  signal puffer_rdreq_s : std_logic;
+  -- signal fifo_wrclk_s   : std_logic;
+  signal puffer_wrreq_s          : std_logic;
+  signal puffer_q_s              : std_logic_vector(11 downto 0);
+  signal puffer_rdempty_s        : std_logic;
+  signal puffer_wrfull_s         : std_logic;
+  signal puffer_wrusedw_s        : std_logic_vector(7 downto 0);
+  signal puffer_rdusedw_s        : std_logic_vector(7 downto 0);
+  signal puffer_wralmostfull_s   : std_logic;
+  signal puffer_rd_almostempty_s : std_logic;
+  signal puffer_wr_used_words_s  : std_logic_vector(8 downto 0);
+  signal puffer_rd_used_words_s  : std_logic_vector(8 downto 0);
+
+  type puffer_states is (write_t, read_t);
+
+  signal puffer_state_s : puffer_states;
+
+  -------------------vga-------------------------------------
+  signal valid_pixel_s : std_logic;
+  signal pixel_data_s  : std_logic_vector(11 downto 0);
+
+  ---------------anwendung-----------------------------------
+  signal ram_write_pointer_s : integer range 0 to 307199; -- 480*640 = 307.200
+  signal ram_read_pointer_s : integer range 0 to 307199;
+
+  ---------------- raw2rgb ----------------------------------
+  signal raw2rgb_pixel_out            : std_logic_vector(11 downto 0);
+  signal raw2rgb_pixel_out_empty      : std_logic;
+  signal raw2rgb_pixel_out_rd_request : std_logic;
+
+  component ram_pll is
+    port (
+      clk_clk             : in    std_logic                     := 'X';
+      reset_reset_n       : in    std_logic                     := 'X';
+      sdram_address       : in    std_logic_vector(24 downto 0) := (others => 'X');
+      sdram_byteenable_n  : in    std_logic_vector(1 downto 0)  := (others => 'X');
+      sdram_chipselect    : in    std_logic                     := 'X';
+      sdram_writedata     : in    std_logic_vector(15 downto 0) := (others => 'X');
+      sdram_read_n        : in    std_logic                     := 'X';
+      sdram_write_n       : in    std_logic                     := 'X';
+      sdram_readdata      : out   std_logic_vector(15 downto 0);
+      sdram_readdatavalid : out   std_logic;
+      sdram_waitrequest   : out   std_logic;
+      clk_143_clk         : out   std_logic;
+      clk_96_clk          : out   std_logic;
+      clk_25_clk          : out   std_logic;
+      wire_addr           : out   std_logic_vector(12 downto 0);
+      wire_ba             : out   std_logic_vector(1 downto 0);
+      wire_cas_n          : out   std_logic;
+      wire_cke            : out   std_logic;
+      wire_cs_n           : out   std_logic;
+      wire_dq             : inout std_logic_vector(15 downto 0) := (others => 'X');
+      wire_dqm            : out   std_logic_vector(1 downto 0);
+      wire_ras_n          : out   std_logic;
+      wire_we_n           : out   std_logic
+    );
+  end component ram_pll;
+
+  component vga_puffer is
+    port (
+      data    : in    std_logic_vector(11 downto 0);
+      rdclk   : in    std_logic;
+      rdreq   : in    std_logic;
+      wrclk   : in    std_logic;
+      wrreq   : in    std_logic;
+      q       : out   std_logic_vector(11 downto 0);
+      rdempty : out   std_logic;
+      wrfull  : out   std_logic;
+      wrusedw : out   std_logic_vector(8 downto 0);
+      rdusedw : out   std_logic_vector(8 downto 0)
+    );
+  end component;
+
+  component vga_controller is
+    port (
+      clock_25    : in    std_logic;
+      reset_n     : in    std_logic;
+      h_sync      : out   std_logic;
+      v_sync      : out   std_logic;
+      valid_pixel : out   std_logic;
+      data_in     : in    std_logic_vector(11 downto 0);
+      data_out    : out   std_logic_vector(11 downto 0)
+    );
+  end component vga_controller;
+
+  component raw2rgb is
+    port (
+      clk_pixel      : in    std_logic;
+      clk_out_puffer : in    std_logic;
+      reset_n        : in    std_logic;
+      pixel_in       : in    std_logic_vector(11 downto 0);
+      lval           : in    std_logic;
+
+      pixel_out              : out   std_logic_vector(11 downto 0);
+      pixel_out_empty        : out   std_logic;
+      pixel_out_read_request : in    std_logic
+    );
+  end component raw2rgb;
+
+begin
+
+  u0 : component ram_pll
+    port map (
+      clk_clk             => clock_50,
+      reset_reset_n       => reset_n,
+      sdram_address       => sdram_addr_s,
+      sdram_byteenable_n  => sdram_be_n_s,
+      sdram_chipselect    => sdram_cs_s,
+      sdram_writedata     => sdram_writedata_s,
+      sdram_read_n        => sdram_re_n_s,
+      sdram_write_n       => sdram_we_n_s,
+      sdram_readdata      => sdram_readdata_s,
+      sdram_readdatavalid => sdram_rdval_s,
+      sdram_waitrequest   => sdram_wait_s,
+      wire_addr           => dram_addr,
+      wire_ba             => dram_ba,
+      wire_cas_n          => dram_cas_n,
+      wire_cke            => dram_cke,
+      wire_cs_n           => dram_cs_n,
+      wire_dq             => dram_dq,
+      wire_dqm            => dram_dqm_s,
+      wire_ras_n          => dram_ras_n,
+      wire_we_n           => dram_we_n,
+      clk_143_clk         => clk143_s,
+      clk_96_clk          => clk_96_s,
+      clk_25_clk          => clk25_175_s
+    );
+
+  u1 : component vga_puffer
+    port map (
+      data    => sdram_out_data_s(11 downto 0),
+      rdclk   => clk25_175_s,
+      rdreq   => puffer_rdreq_s,
+      wrclk   => clk143_s,
+      wrreq   => puffer_wrreq_s,
+      q       => puffer_q_s,
+      rdempty => puffer_rdempty_s,
+      wrfull  => puffer_wrfull_s,
+      wrusedw => puffer_wr_used_words_s,
+      rdusedw => puffer_rd_used_words_s
+
+    );
+
+  u2 : component vga_controller
+    port map (
+      clock_25    => clk25_175_s,
+      reset_n     => reset_n,
+      h_sync      => h_sync,
+      v_sync      => v_sync,
+      valid_pixel => valid_pixel_s,
+      data_in     => pixel_data_s,
+      data_out    => vga_out
+    );
+
+  u3 : component raw2rgb
+    port map (
+      clk_pixel      => clk_96_s,
+      clk_out_puffer => clk143_s,
+      reset_n        => reset_n,
+      pixel_in       => camera_pixel_out,
+      lval           => camera_lval,
+
+      pixel_out              => raw2rgb_pixel_out,
+      pixel_out_empty        => raw2rgb_pixel_out_empty,
+      pixel_out_read_request => raw2rgb_pixel_out_rd_request
+    );
+
+  p_ram : process (clk143_s, reset_n) is
+  begin
+
+    if (falling_edge(clk143_s)) then
+
+      case (puffer_state_s) is
+
+        when write_t =>
+
+          if (to_integer(unsigned(puffer_wr_used_words_s)) > 400) then
+            puffer_state_s <= read_t;
+          end if;
+
+          if (sdram_wait_s = '0' and raw2rgb_pixel_out_empty = '0') then
+            sdram_we_n_s              <= '0';
+            sdram_writedata_s         <= "0000" & raw2rgb_pixel_out;
+            sdram_addr_s(24 downto 0) <= std_logic_vector(to_unsigned(ram_write_pointer_s, sdram_addr_s'length));
+
+            if (ram_write_pointer_s < 307199) then
+              ram_write_pointer_s <= ram_write_pointer_s + 1;
+            else
+              ram_write_pointer_s <= 0;
+            end if;
+          end if;
+
+        when read_t =>
+          if(to_integer(unsigned(puffer_rd_used_words_s)) < 50) then
+            puffer_state_s <= write_t;
+            end if;
+
+          sdram_we_n_s <= '1';
+          sdram_addr_s(24 downto 0) <= std_logic_vector(to_unsigned(ram_read_pointer_s, sdram_addr_s'length));
+
+          if(sdram_rdval_s = '1' and puffer_wrfull_s = '0') then
+            if(ram_read_pointer_s < 307199) then
+              sdram_out_data_s <= sdram_readdata_s;
+              ram_read_pointer_s <= ram_read_pointer_s + 1;
+            else
+              ram_read_pointer_s <= 0;
+            end if;
+            end if;
+
+      end case;
+
+    end if;
+
+  end process p_ram;
+
+  vga : process(clk25_175_s) is
+  begin
+    if rising_edge(clk25_175_s) then
+      if(puffer_rdempty_s = '0') then
+        puffer_rdreq_s <= '1';
+        pixel_data_s <= puffer_q_s(11 downto 0);
+      else
+        puffer_rdreq_s <= '0';
+        end if;
+      end if;
+    end process;
+
+    
+
+  dram_ldqm    <= dram_dqm_s(0);
+  dram_udqm    <= dram_dqm_s(1);
+  dram_clk     <= clk143_s;
+  sdram_cs_s   <= '1';
+  sdram_be_n_s <= "00";
+
+end architecture rtl;
